@@ -604,6 +604,26 @@ class FeatureInstanceBase(GeographicBoundingBox):
     date_time_of_first_record_attribute_name = "dateTimeOfFirstRecord"
     date_time_of_last_record_attribute_name = "dateTimeOfLastRecord"
 
+
+    def write(self, hdf5_object):
+        super().write(hdf5_object)
+        # find any group_NNN objects
+        chunking = None
+        for _pattern, group_attrib in self.get_standard_list_properties().items():
+            group_list = self.__getattribute__(group_attrib)
+            for grp in group_list:
+                # now we are going to take advantage of the h5py interface to get the chunks attribute from each dataset
+                # the S100 spec says things should be written with datasets named 'values'
+                # if this does not hold true in the future then we could search for datasets generically here
+                try:
+                    chunking = hdf5_object[grp._hdf5_path.split("/")[-1] + '/values'].chunks
+                except KeyError:
+                    pass
+        if chunking is not None:
+            self.instance_chunking = chunking
+            # now that we updated the chunking attribute we need to re-write them (but not the datasets etc)
+            self.write_simple_attributes(hdf5_object)
+
     @property
     def vertical_extent_minimum_z(self) -> float:
         return self._attributes[self.vertical_extent_minimum_z_attribute_name]
@@ -663,7 +683,11 @@ class FeatureInstanceBase(GeographicBoundingBox):
         return self._attributes[self.instance_chunking_attribute_name]
 
     @instance_chunking.setter
-    def instance_chunking(self, val: str):
+    def instance_chunking(self, val: Union[str, list, tuple]):
+        if isinstance(val, str):
+            pass
+        else:
+            val = ",".join(str(a) for a in val)
         self._attributes[self.instance_chunking_attribute_name] = val
 
     @property
@@ -1450,10 +1474,32 @@ class FeatureContainer(S1xxAttributesBase):
         # pylint: disable=attribute-defined-outside-init
         self.interpolation_type = self.interpolation_type_type['nearestneighbor']
 
+class GroupFBase(S1xxAttributesBase):
+    """ Table 10.3 and sect 10.2.2 of v1.0.1
+    """
+    feature_code_attribute_name = "featureCode"
+
+    @property
+    def feature_code_type(self):
+        return numpy.array
+
+    @abstractmethod
+    def feature_code_create(self):
+        raise NotImplementedError("must overload feature_code_create")
+
+    @property
+    def feature_code(self) -> s1xx_sequence:
+        return self._attributes[self.feature_code_attribute_name]
+
+    @feature_code.setter
+    def feature_code(self, val: s1xx_sequence):
+        self._attributes[self.feature_code_attribute_name] = val
+
 
 class S100Root(GeographicBoundingBox):
     """ From table 10c-6 in S100 spec.
     """
+    feature_information_attribute_name = "Group_F"
     horizontal_datum_reference_attribute_name = "horizontalDatumReference"
     horizontal_datum_value_attribute_name = "horizontalDatumValue"
     epoch_attribute_name = "epoch"
@@ -1468,6 +1514,73 @@ class S100Root(GeographicBoundingBox):
     @property
     def __version__(self) -> int:
         return 1
+
+    def write(self, group_object):
+        super().write(group_object)
+        # any grids that were had datasets which possible chunking should now be written
+        # and we can look through those to get the overall chunking attribute
+        # and put that into the GroupF FeatureInformation object
+        feat_info = None
+        for property_name in self.get_standard_properties():
+            if issubclass(self.__getattribute__(property_name + "_type"), GroupFBase):
+                feat_info = self.__getattribute__(property_name)
+        # we have the GroupF data now, we can look at the names of the FeatureInstances and then search each for its respective chunking
+        if feat_info is not None:
+            # this will be the names of the feature instances
+            # e.g. BathymetryCoverage for S102 or SurfaceCurrent for S111
+            for feat_name in feat_info.feature_code:
+                # get the associated python name for the feature, e.g. turn SurfaceCurrent into surface_current
+                chunking = None
+                try:
+                    python_name = self.get_standard_properties_mapping()[feat_name]
+                except KeyError:
+                    python_name = self.get_standard_properties_mapping()[feat_name.decode()]
+                # grab the root/SurfaceCurrent data
+                feat_container = self.__getattribute__(python_name)
+                # now look through all the SurfaceCurrent_01, SurfaceCurrent_02...
+                # so find the list object (there really only should be one and it should match the naming but we'll be general here)
+                for pattern, list_name in feat_container.get_standard_list_properties().items():
+                    try:
+                        list_of_features = feat_container.__getattribute__(list_name)
+                    except KeyError:  # not initialized
+                        list_of_features = []
+                    for feat_instance in list_of_features:
+                        try:
+                            chunking = feat_instance.instance_chunking
+                        except:
+                            pass
+                if chunking is not None:
+                    # find the GroupF feature dataset, e.g. /GroupF/SurrfaceCurrent
+                    try:
+                        groupf_python_name = feat_info.get_standard_properties_mapping()[feat_name]
+                    except KeyError:
+                        groupf_python_name = feat_info.get_standard_properties_mapping()[feat_name.decode()]
+                    # Get the python object
+                    feat_info_dataset = feat_info.__getattribute__(groupf_python_name)
+                    # set chunking
+                    feat_info_dataset.chunking = chunking
+                    # and now use HDF5 pathing to write the chunking part back out
+                    # in theory whis would work from any level, not just the root
+                    relative_hdf5_dataset_path = "/".join(feat_info_dataset._hdf5_path.split("/")[-2:])
+                    feat_info_dataset.write_simple_attributes(group_object[relative_hdf5_dataset_path])
+
+    @property
+    def feature_information(self) -> GroupFBase:
+        return self._attributes[self.feature_information_attribute_name]
+
+    @feature_information.setter
+    def feature_information(self, val: GroupFBase):
+        self._attributes[self.feature_information_attribute_name] = val
+
+    @property
+    @abstractmethod
+    def feature_information_type(self):
+        raise NotImplementedError()
+
+    def feature_information_create(self):
+        # noinspection PyAttributeOutsideInit
+        # pylint: disable=attribute-defined-outside-init
+        self.feature_information = self.feature_information_type()
 
     @property
     def product_specification(self) -> str:
